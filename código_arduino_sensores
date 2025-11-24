@@ -1,0 +1,178 @@
+/*
+ * PROJETO: Estufa Automatizada IoT
+ * EQUIPE: Rafael, Matheus, Samir, Vitor, Pedro, Natasha, Sthefany, Mario, Mikael, Samuel.
+ * ETEC DE EMBU - 2025
+ * * DESCRIÇÃO DO CÓDIGO (ARDUINO UNO):
+ * O Arduino é o "músculo" do projeto. Ele lê os sensores e decide se liga a bomba.
+ * * DESAFIO TÉCNICO:
+ * O maior desafio aqui foi não usar 'delay()'. Se usássemos delay, o Arduino pararia
+ * de ler os sensores enquanto espera o tempo passar. Usamos a técnica de 'millis()'
+ * para criar um sistema multitarefa.
+ */
+
+#include <Wire.h>               // Comunicação I2C
+#include <LiquidCrystal_I2C.h>  // Display LCD
+#include <OneWire.h>            // Protocolo sensor temp
+#include <DallasTemperature.h>  // Sensor DS18B20
+#include <BH1750.h>             // Sensor de Luz
+#include <SoftwareSerial.h>     // Para falar com o ESP32
+
+// --- DEFINIÇÃO DE PINOS ---
+// Usamos pinos digitais para simular serial porque o HardwareSerial(0 e 1) é usado no USB
+SoftwareSerial espSerial(10, 11); // RX, TX
+
+// Display LCD 16x2 (Endereço 0x27 padrão)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Sensor de Temperatura (DS18B20) - Pino digital 12
+OneWire oneWire(12);
+DallasTemperature sensorTemp(&oneWire);
+
+// Sensor de Luz (BH1750) - I2C (Pinos A4 e A5)
+BH1750 luxMeter;
+
+// Pinos de Controle Analógicos e Digitais
+const int PINO_UMIDADE = A0; 
+const int PINO_RELE_BOMBA = 7;
+const int PINO_BOIA_NIVEL = 13;
+
+// --- CALIBRAÇÃO (Ajuste Fino) ---
+// Estes valores foram obtidos testando o sensor na prática (seco vs copo d'água)
+const int UMIDADE_SECO = 615;
+const int UMIDADE_MOLHADO = 349;
+
+// --- VARIÁVEIS DE CONTROLE (Estado) ---
+unsigned long tempoUltimaTrocaTela = 0;
+int telaAtual = 0;
+
+// Timer de segurança da bomba (para não queimar se acabar a água)
+unsigned long inicioFaltaDeAgua = 0;
+bool bombaLigada = false;
+char ipEsp32[16] = "0.0.0.0"; // Guarda o IP recebido do ESP32
+
+void setup() {
+  Serial.begin(9600);    // Debug
+  espSerial.begin(9600); // Comunicação com ESP32
+
+  // Configuração dos Pinos
+  pinMode(PINO_RELE_BOMBA, OUTPUT);
+  digitalWrite(PINO_RELE_BOMBA, LOW); // Começa desligado por segurança
+  
+  // O pino da boia usa o resistor interno (PULLUP). 
+  // Isso economiza um resistor físico na placa.
+  pinMode(PINO_BOIA_NIVEL, INPUT_PULLUP);
+
+  // Inicialização dos Módulos
+  sensorTemp.begin();
+  lcd.init();
+  lcd.backlight();
+  Wire.begin();
+  
+  // Tenta iniciar o sensor de luz (tratamento de erro básico)
+  if (luxMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
+    Serial.println("Luximetro OK");
+  } else {
+    Serial.println("Erro no Luximetro - Verifique cabos I2C");
+  }
+
+  // Tela de boas vindas
+  lcd.setCursor(0,0);
+  lcd.print("Iniciando...");
+  lcd.setCursor(0,1);
+  lcd.print("Estufa IoT v1.0");
+  delay(3000); // Aqui o delay é ok, é só na abertura
+  lcd.clear();
+}
+
+// --- FUNÇÃO AUXILIAR: CALCULAR PORCENTAGEM ---
+int lerUmidadePorcentagem() {
+  int leitura = analogRead(PINO_UMIDADE);
+  // A função map transforma a leitura bruta (ex: 500) em porcentagem (0-100)
+  // O constrain garante que não passe de 100 nem desça de 0
+  int porc = map(leitura, UMIDADE_SECO, UMIDADE_MOLHADO, 0, 100);
+  return constrain(porc, 0, 100);
+}
+
+// --- FUNÇÃO AUXILIAR: CLASSIFICAÇÃO DE QUALIDADE ---
+// Define se o valor está "Bom" ou "Ruim" baseado em pesquisa da Embrapa
+String avaliarStatus(float valor, float min, float max) {
+  if (valor >= min && valor <= max) return "Bom";
+  return "Atencao"; 
+}
+
+void loop() {
+  // 1. LEITURA DOS SENSORES (Rápida)
+  sensorTemp.requestTemperatures();
+  float temp = sensorTemp.getTempCByIndex(0);
+  int umidade = lerUmidadePorcentagem();
+  float luz = luxMeter.readLightLevel();
+  
+  // Leitura da Boia (LOW significa que tem água, por causa do PULLUP)
+  bool temAgua = (digitalRead(PINO_BOIA_NIVEL) == LOW);
+
+  // 2. LÓGICA DE CONTROLE DA BOMBA (AUTOMOLHA)
+  // Regra: Solo seco (<50%) E tem água no reservatório
+  if (umidade < 50 && temAgua) {
+    digitalWrite(PINO_RELE_BOMBA, HIGH);
+    bombaLigada = true;
+    inicioFaltaDeAgua = 0; // Reseta timer
+  } 
+  // Regra: Solo úmido OU sem água -> Desliga
+  else {
+    // Se a água acabou enquanto a bomba estava ligada, esperamos 3 segundos antes de desligar
+    // Isso evita que a bomba fique "picotando" com o balanço da água na caixa
+    if (!temAgua && bombaLigada) {
+       if (inicioFaltaDeAgua == 0) inicioFaltaDeAgua = millis();
+       
+       if (millis() - inicioFaltaDeAgua > 3000) {
+         digitalWrite(PINO_RELE_BOMBA, LOW);
+         bombaLigada = false;
+       }
+    } else {
+       // Se o solo ficou úmido, desliga na hora
+       digitalWrite(PINO_RELE_BOMBA, LOW);
+       bombaLigada = false;
+    }
+  }
+
+  // 3. COMUNICAÇÃO E DISPLAY (A cada 4 segundos)
+  // Usamos millis para não travar a bomba
+  if (millis() - tempoUltimaTrocaTela > 4000) {
+    tempoUltimaTrocaTela = millis();
+    
+    // Atualiza LCD (Carrossel de telas)
+    lcd.clear();
+    switch(telaAtual) {
+      case 0:
+        lcd.print("Temp: "); lcd.print(temp, 1); lcd.print(" C");
+        lcd.setCursor(0,1); lcd.print("Umid: "); lcd.print(umidade); lcd.print("%");
+        break;
+      case 1:
+        lcd.print("Luz: "); lcd.print((int)luz); lcd.print(" lx");
+        lcd.setCursor(0,1); lcd.print("Sts: "); lcd.print(avaliarStatus(luz, 4000, 8000));
+        break;
+      case 2:
+        lcd.print("Res: "); lcd.print(temAgua ? "OK" : "VAZIO");
+        lcd.setCursor(0,1); lcd.print("IP: "); lcd.print(ipEsp32);
+        break;
+    }
+    telaAtual = (telaAtual + 1) % 3; // Vai de 0 a 2 e volta pra 0
+
+    // Envia dados para o ESP32 via Serial
+    // Formato CSV simples: TEMP:XX,UMID:XX...
+    espSerial.print("TEMP:"); espSerial.print(temp, 1);
+    espSerial.print(",UMID:"); espSerial.print(umidade);
+    espSerial.print(",LUM:"); espSerial.print((int)luz);
+    espSerial.print(",RES:"); espSerial.println(temAgua ? "ABASTECIDO" : "VAZIO");
+  }
+
+  // 4. LER DADOS QUE O ESP32 MANDOU (IP)
+  if (espSerial.available()) {
+    String msg = espSerial.readStringUntil('\n');
+    if (msg.startsWith("IP:")) {
+      String ipLimpo = msg.substring(3);
+      ipLimpo.trim();
+      ipLimpo.toCharArray(ipEsp32, 16);
+    }
+  }
+}
