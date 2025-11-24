@@ -1,0 +1,267 @@
+/*
+ * PROJETO: Estufa Automatizada IoT
+ * EQUIPE: Rafael, Matheus, Samir, Vitor, Pedro, Natasha, Sthefany, Mario, Mikael, Samuel.
+ * ETEC DE EMBU - 2025
+ * * DESCRIÇÃO DO CÓDIGO (ESP32):
+ * Este código transforma o ESP32 em um servidor web. A lógica principal é:
+ * 1. Criar uma rede Wi-Fi própria (Access Point).
+ * 2. Ficar ouvindo a Porta Serial 2 (onde o Arduino está conectado).
+ * 3. Quando chega dado do Arduino, a gente "quebra" o texto e atualiza as variáveis.
+ * 4. Quando alguém entra no site, o ESP32 monta o HTML e manda de volta.
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+
+// --- CONFIGURAÇÕES DE HARDWARE ---
+// Usamos a Serial2 porque a Serial padrão (0) é usada para debug no PC.
+// O pino 16 (RX) recebe o que o Arduino manda.
+#define RX_PIN 16 
+#define TX_PIN 17
+
+// Variáveis que seguram os dados mais recentes.
+// Iniciamos com "..." para saber se o dado ainda não chegou.
+String temperatura = "...";
+String umidade = "...";
+String luminosidade = "...";
+String reservatorio = "...";
+
+// Buffer para montar a frase que vem do Arduino caractere por caractere
+String bufferSerial = "";
+
+// Configurações da Rede que o ESP vai criar
+const char* SSID_NOME = "ESTUFA-NET";
+const char* SSID_SENHA = "ESTUFA@ETEC"; // Senha segura ;)
+
+WebServer servidor(80); // Porta padrão da web
+
+// Controle de tempo para mandar o IP pro Arduino sem travar o processador
+unsigned long lastIpSendTime = 0;
+const long INTERVALO_ENVIO_IP = 10000; // 10 segundos
+
+// --------------------------------------------------------------------------
+// HTML DA PÁGINA
+// Armazenamos o site inteiro dentro dessa String gigante (R"rawliteral").
+// Fizemos um CSS responsivo para ficar bonito no celular também.
+// --------------------------------------------------------------------------
+String gerarPaginaWeb() {
+  return R"rawliteral(
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Painel Estufa ETEC</title>
+<style>
+  /* Design inspirado em Dashboards modernos (Dark Mode) */
+  body { font-family: 'Segoe UI', sans-serif; background: #1a1a2e; color: #fff; text-align: center; margin: 0; padding: 20px; }
+  h1 { color: #00d2d3; margin-bottom: 30px; }
+  
+  .container { display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; max-width: 1000px; margin: 0 auto; }
+  
+  .card { 
+    background: #16213e; 
+    border-radius: 15px; 
+    padding: 20px; 
+    width: 250px; 
+    box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+    border-bottom: 4px solid #0f3460;
+  }
+  
+  .card h2 { margin: 0; font-size: 1.2rem; color: #a0a0a0; }
+  .valor { font-size: 2.5rem; font-weight: bold; margin: 15px 0; }
+  .unidade { font-size: 1rem; color: #666; }
+  
+  /* Cores específicas para cada sensor para facilitar leitura visual */
+  #temp { color: #ff6b6b; }
+  #umid { color: #48dbfb; }
+  #lum { color: #feca57; }
+  #res { color: #1dd1a1; font-size: 1.8rem; }
+
+  .btn-group { margin-top: 40px; }
+  button {
+    background: #0f3460; color: white; border: none; padding: 10px 20px;
+    border-radius: 5px; cursor: pointer; margin: 5px; font-size: 1rem;
+    transition: 0.3s;
+  }
+  button:hover { background: #e94560; }
+
+  .info-box { 
+    display: none; background: #2c2c54; margin: 20px auto; 
+    padding: 20px; border-radius: 10px; max-width: 800px; text-align: left; 
+  }
+  .info-box.visible { display: block; animation: fadeIn 0.5s; }
+
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+</style>
+</head>
+<body>
+
+<h1>🌿 Monitoramento Estufa IoT</h1>
+
+<div class="container">
+    <div class="card">
+        <h2>TEMPERATURA</h2>
+        <div class="valor" id="temp">)rawliteral" + temperatura + R"rawliteral(</div>
+        <span class="unidade">Graus Celsius</span>
+    </div>
+    <div class="card">
+        <h2>UMIDADE SOLO</h2>
+        <div class="valor" id="umid">)rawliteral" + umidade + R"rawliteral(</div>
+        <span class="unidade">Porcentagem</span>
+    </div>
+    <div class="card">
+        <h2>LUMINOSIDADE</h2>
+        <div class="valor" id="lum">)rawliteral" + luminosidade + R"rawliteral(</div>
+        <span class="unidade">Lux</span>
+    </div>
+    <div class="card">
+        <h2>RESERVATÓRIO</h2>
+        <div class="valor" id="res">)rawliteral" + reservatorio + R"rawliteral(</div>
+        <span class="unidade">Status</span>
+    </div>
+</div>
+
+<div class="btn-group">
+    <button onclick="toggle('sobre')">Sobre o Projeto</button>
+    <button onclick="toggle('qualidade')">Parâmetros de Qualidade</button>
+</div>
+
+<div id="sobre" class="info-box">
+    <h3>📌 Sobre o Projeto</h3>
+    <p>Desenvolvido pela turma de Redes (2025) da ETEC de Embu. Este sistema utiliza IoT para automatizar a irrigação baseada na necessidade real da planta, economizando água.</p>
+    <p><b>Equipe:</b> Rafael, Matheus, Samir, Vitor, Pedro, Natasha, Sthefany, Mario, Mikael, Samuel.</p>
+</div>
+
+<div id="qualidade" class="info-box">
+    <h3>📊 Parâmetros Agronômicos</h3>
+    <p><b>Temp Ideal:</b> 15°C a 22°C (Evita pendoamento em alfaces)</p>
+    <p><b>Umidade Ideal:</b> 60% a 80% (Capacidade de campo)</p>
+</div>
+
+<script>
+    // Javascript simples para fazer a página atualizar sozinha sem F5
+    function toggle(id) {
+        let el = document.getElementById(id);
+        el.classList.toggle('visible');
+    }
+
+    // Função que busca o JSON no ESP32 a cada 2 segundos
+    setInterval(async () => {
+        try {
+            const response = await fetch('/dados');
+            const data = await response.json();
+            
+            document.getElementById('temp').innerText = data.temperatura + "°";
+            document.getElementById('umid').innerText = data.umidade + "%";
+            document.getElementById('lum').innerText = data.luminosidade;
+            document.getElementById('res').innerText = data.reservatorio;
+        } catch (e) { console.log("Aguardando conexão..."); }
+    }, 2000);
+</script>
+
+</body>
+</html>
+)rawliteral";
+}
+
+// --------------------------------------------------------------------------
+// ROTAS DO SERVIDOR
+// Aqui definimos o que acontece quando alguém acessa o IP
+// --------------------------------------------------------------------------
+
+// Rota principal (/)
+void handleRoot() {
+  servidor.send(200, "text/html", gerarPaginaWeb());
+}
+
+// Rota de API (/dados)
+// O Javascript acessa isso aqui para pegar só os números, sem recarregar a página toda.
+void handleDados() {
+  String json = "{";
+  json += "\"temperatura\":\"" + temperatura + "\",";
+  json += "\"umidade\":\"" + umidade + "\",";
+  json += "\"luminosidade\":\"" + luminosidade + "\",";
+  json += "\"reservatorio\":\"" + reservatorio + "\"";
+  json += "}";
+  servidor.send(200, "application/json", json);
+}
+
+// --------------------------------------------------------------------------
+// LÓGICA DE PROCESSAMENTO DE DADOS (PARSER)
+// Recebe a string "suja" do Arduino e separa os valores
+// Exemplo entrada: "TEMP:25.00,UMID:60,LUM:5000,RES:CHEIO"
+// --------------------------------------------------------------------------
+void processarLinhaArduino(String linha) {
+  // Debug no Serial do PC
+  Serial.println("RX: " + linha);
+
+  int idxT = linha.indexOf("TEMP:");
+  int idxU = linha.indexOf("UMID:");
+  int idxL = linha.indexOf("LUM:");
+  int idxR = linha.indexOf("RES:");
+
+  // Só atualizamos se a mensagem vier completa (segurança contra dados corrompidos)
+  if (idxT != -1 && idxU != -1 && idxL != -1 && idxR != -1) {
+    temperatura = linha.substring(idxT + 5, idxU - 1); // Pega o que está entre TEMP: e a virgula
+    temperatura.trim(); 
+
+    umidade = linha.substring(idxU + 5, idxL - 1);
+    umidade.trim();
+
+    luminosidade = linha.substring(idxL + 4, idxR - 1);
+    luminosidade.trim();
+
+    reservatorio = linha.substring(idxR + 4);
+    reservatorio.trim();
+    
+    // Formata o texto do reservatório para ficar bonito na tela
+    if(reservatorio.equalsIgnoreCase("ABASTECIDO")) reservatorio = "Normal";
+    if(reservatorio.equalsIgnoreCase("VAZIO")) reservatorio = "Alerta!";
+  }
+}
+
+void setup() {
+  Serial.begin(115200); // Debug PC
+  Serial2.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN); // Comunicação com Arduino
+
+  // Configura o Wi-Fi no modo Access Point (Cria a rede)
+  WiFi.softAP(SSID_NOME, SSID_SENHA);
+  
+  Serial.println("\n--- ESTUFA ONLINE ---");
+  Serial.print("IP para acesso: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Define as rotas
+  servidor.on("/", handleRoot);
+  servidor.on("/dados", handleDados);
+  
+  servidor.begin();
+}
+
+void loop() {
+  // Mantém o servidor vivo
+  servidor.handleClient();
+
+  // 1. LER DADOS DO ARDUINO
+  while (Serial2.available()) {
+    char c = Serial2.read();
+    // Se chegou o "Enter" (\n), a frase acabou. Hora de processar.
+    if (c == '\n') {
+      bufferSerial.trim();
+      if (bufferSerial.length() > 0) processarLinhaArduino(bufferSerial);
+      bufferSerial = ""; // Limpa para a próxima frase
+    } else {
+      bufferSerial += c;
+    }
+  }
+
+  // 2. ENVIAR O IP PARA O ARDUINO (A CADA 10s)
+  // Usamos millis() em vez de delay() para o site não travar
+  if (millis() - lastIpSendTime > INTERVALO_ENVIO_IP) {
+    lastIpSendTime = millis();
+    IPAddress ip = WiFi.softAPIP();
+    Serial2.print("IP:");
+    Serial2.println(ip);
+  }
+}
