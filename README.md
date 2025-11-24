@@ -1,7 +1,7 @@
 # horta_automatizada_iot
 
 Estufa Inteligente IoT (ESP32 + Arduino) 🌿💧
-Projeto de automação agrícola desenvolvido como Trabalho de Conclusão de Curso (TCC) / Semana Técnica na ETEC de Embu (2025).
+Projeto de automação agrícola desenvolvido para a Semana Técnica na ETEC de Embu (2025).
 
 📖 Sobre o Projeto
 
